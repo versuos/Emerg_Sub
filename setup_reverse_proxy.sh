@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script to install and configure Nginx as a Reverse Proxy for x-ui subscription
-# Run as root: sudo bash setup_reverse_proxy.sh
+# Run as root: sudo bash setup_reverse_proxy_final.sh
 
 # Exit on error
 set -e
@@ -15,12 +15,21 @@ VLESS_CONFIG="vless://8443b331-a885-4786-bed7-5e8dfe34cd49@serv.styxx.click:3236
 NGINX_CONFIG="/etc/nginx/sites-available/reverse_proxy"
 PROXY_SCRIPT="/usr/local/bin/proxy_modifier.py"
 
-# Step 1: Update system and install Nginx and Certbot
-echo "Updating system and installing Nginx and Certbot..."
+# Step 1: Update system and install Nginx with Lua module and Certbot
+echo "Updating system and installing Nginx with Lua module and Certbot..."
 apt-get update -y
-apt-get install -y nginx python3-certbot-nginx
+apt-get install -y nginx nginx-extras libnginx-mod-http-lua python3-certbot-nginx
 
-# Step 2: Configure Nginx Reverse Proxy
+# Step 2: Verify Lua module
+echo "Verifying Nginx Lua module..."
+if ! nginx -V 2>&1 | grep -q lua; then
+    echo "Installing Nginx stable repository for Lua module..."
+    add-apt-repository ppa:nginx/stable -y
+    apt-get update -y
+    apt-get install -y nginx nginx-extras libnginx-mod-http-lua
+fi
+
+# Step 3: Configure Nginx Reverse Proxy
 echo "Configuring Nginx Reverse Proxy..."
 cat > $NGINX_CONFIG <<EOL
 server {
@@ -49,11 +58,19 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_pass_request_headers on;
+
+        # Modify response with Lua and Python script
+        content_by_lua_block {
+            local handle = io.popen("$PROXY_SCRIPT", "r+")
+            handle:write(ngx.arg[1])
+            handle:close()
+            ngx.arg[1] = handle:read("*a")
+        }
     }
 }
 EOL
 
-# Step 3: Create SSL params snippet
+# Step 4: Create SSL params snippet
 echo "Creating SSL parameters snippet..."
 mkdir -p /etc/nginx/snippets
 cat > /etc/nginx/snippets/ssl-params.conf <<EOL
@@ -75,25 +92,16 @@ add_header X-XSS-Protection "1; mode=block";
 ssl_dhparam /etc/ssl/certs/dhparam.pem;
 EOL
 
-# Step 4: Generate Diffie-Hellman group
+# Step 5: Generate Diffie-Hellman group
 echo "Generating Diffie-Hellman group..."
 openssl dhparam -out /etc/ssl/certs/dhparam.pem 2048
 
-# Step 5: Enable Nginx configuration
+# Step 6: Enable Nginx configuration
 echo "Enabling Nginx configuration..."
 ln -sf $NGINX_CONFIG /etc/nginx/sites-enabled/reverse_proxy
 rm -f /etc/nginx/sites-enabled/default
 
-# Step 6: Test and reload Nginx
-echo "Testing and reloading Nginx..."
-nginx -t
-systemctl reload nginx
-
-# Step 7: Obtain SSL certificate with Certbot
-echo "Obtaining SSL certificate..."
-certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN
-
-# Step 8: Create Python script to modify subscription response
+# Step 7: Create Python script to append VLESS config
 echo "Creating Python script to append VLESS config..."
 cat > $PROXY_SCRIPT <<EOL
 #!/usr/bin/env python3
@@ -113,50 +121,32 @@ except:
 vless_config = "$VLESS_CONFIG"
 output_data = decoded_data + "\\n" + vless_config
 
-# Encode back to base64 if needed
+# Encode back to base64
 print(base64.b64encode(output_data.encode('utf-8')).decode('utf-8'))
 EOL
 
 # Make Python script executable
 chmod +x $PROXY_SCRIPT
 
-# Step 9: Update Nginx to use Python script
-echo "Updating Nginx to use Python script..."
-sed -i "/proxy_pass_request_headers on;/a \    proxy_pass http://127.0.0.1:8080;" $NGINX_CONFIG
-cat >> $NGINX_CONFIG <<EOL
-
-server {
-    listen 8080;
-    location $SUBSCRIPTION_PATH {
-        proxy_pass http://127.0.0.1:$SUBSCRIPTION_PORT$SUBSCRIPTION_PATH;
-        proxy_set_header Host \$http_host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_pass_request_headers on;
-        # Pipe response through Python script
-        filter_by_lua_block {
-            local handle = io.popen("$PROXY_SCRIPT", "r+")
-            handle:write(ngx.arg[1])
-            handle:close()
-            ngx.arg[1] = handle:read("*a")
-        }
-    }
-}
-EOL
-
-# Step 10: Install Lua module for Nginx
-echo "Installing Nginx Lua module..."
-apt-get install -y lua-nginx-module
-
-# Step 11: Test and reload Nginx again
+# Step 8: Test and reload Nginx
 echo "Testing and reloading Nginx..."
 nginx -t
-systemctl reload nginx
+systemctl restart nginx
 
-# Step 12: Enable Nginx and Certbot auto-renewal
+# Step 9: Obtain SSL certificate with Certbot
+echo "Obtaining SSL certificate..."
+certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN
+
+# Step 10: Open firewall ports
+echo "Opening firewall ports..."
+ufw allow 80
+ufw allow 443
+ufw status
+
+# Step 11: Enable Nginx and Certbot auto-renewal
 echo "Enabling Nginx and Certbot auto-renewal..."
 systemctl enable nginx
 echo "30 2 * * 1 /usr/bin/certbot renew --quiet && systemctl reload nginx" >> /etc/crontab
 
 echo "Setup complete! Access your subscription at https://$DOMAIN$SUBSCRIPTION_PATH$USER_ID"
+echo "Test with: curl https://$DOMAIN$SUBSCRIPTION_PATH$USER_ID"
